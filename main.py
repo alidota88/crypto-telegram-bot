@@ -2,13 +2,17 @@ import os
 import logging
 import requests
 from typing import List, Dict
+from dataclasses import dataclass
 
+import pandas as pd
+import numpy as np
 from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
 )
+from macd_rsi_strategy import MACDRSIStrategy  # 引用你的策略类
 
 # 从环境变量里读取 Telegram Bot 的 Token（在 Railway 里配置）
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -19,10 +23,165 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ======= 模拟资金与仓位管理 =======
+TOTAL_CAPITAL = 10_000.0      # 总资金（仅做显示，不做严格风控）
+PER_TRADE_NOTIONAL = 2_000.0  # 每个品种固定 2000 USDT
+
+TRADE_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
+
+
+@dataclass
+class Position:
+    symbol: str
+    side: str           # "long" or "short"
+    entry_price: float
+    qty: float
+    notional: float
+    realized_pnl: float = 0.0
+
+
+# 当前持仓（内存简单版）
+POSITIONS: Dict[str, Position] = {}
+
+# 实现盈亏累计
+TOTAL_REALIZED_PNL: float = 0.0
+
+# 策略实例（全局用一个）
+strategy = MACDRSIStrategy()
+
+BINANCE_BASE = "https://api.binance.com"
+
+
+def fetch_15m_klines(symbol: str, limit: int = 300) -> pd.DataFrame:
+    """
+    从 Binance 获取 15m K 线，并转成 DataFrame:
+    index = 时间（DatetimeIndex, freq=15min 升序）
+    columns = open, high, low, close, volume
+    """
+    url = f"{BINANCE_BASE}/api/v3/klines"
+    params = {
+        "symbol": symbol,
+        "interval": "15m",
+        "limit": limit,
+    }
+    resp = requests.get(url, params=params, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+
+    # kline 结构: [open_time, open, high, low, close, volume, close_time, ...]
+    df = pd.DataFrame(
+        data,
+        columns=[
+            "open_time", "open", "high", "low", "close", "volume",
+            "close_time", "quote_asset_volume", "number_of_trades",
+            "taker_buy_base", "taker_buy_quote", "ignore",
+        ],
+    )
+
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+    df.set_index("open_time", inplace=True)
+    df = df[["open", "high", "low", "close", "volume"]].astype(float)
+    df.index = df.index.sort_values()
+    return df
+
 # ========= 全局订阅表（简单版：内存里存一份） =========
 PRICE_SUBSCRIBERS: set[int] = set()
 STRATEGY_SUBSCRIBERS: set[int] = set()
 
+def run_strategy_and_update_positions() -> str:
+    """
+    对 TRADE_SYMBOLS 逐个跑策略，更新模拟持仓 & 计算盈亏，
+    返回一段适合发到 Telegram 的文本。
+    """
+    global TOTAL_REALIZED_PNL
+
+    lines: List[str] = []
+    lines.append("[策略信号 + 仓位模拟（每小时）]")
+    lines.append(f"总资金假设: {TOTAL_CAPITAL:.2f} USDT, 每个品种开仓: {PER_TRADE_NOTIONAL:.2f} USDT\n")
+
+    for symbol in TRADE_SYMBOLS:
+        try:
+            df_15m = fetch_15m_klines(symbol, limit=300)
+            df_sig = strategy.generate_signals(df_15m)
+            last = df_sig.iloc[-1]
+            last_price = float(last["close"])
+            signal = int(last["signal"])  # 1=多, -1=空, 0=无操作
+
+            pos = POSITIONS.get(symbol)
+            symbol_line: List[str] = [f"{symbol} 当前价: {last_price:.4f}"]
+
+            # 1) 如果有持仓，先计算浮动盈亏
+            unreal_pnl = 0.0
+            if pos is not None:
+                if pos.side == "long":
+                    unreal_pnl = (last_price - pos.entry_price) * pos.qty
+                else:
+                    unreal_pnl = (pos.entry_price - last_price) * pos.qty
+
+            # 2) 信号逻辑：先平后开（简单版）
+            # 平仓条件：已有仓位 && (信号反向 或 signal == 0)
+            if pos is not None and (signal == 0 or (signal == 1 and pos.side == "short") or (signal == -1 and pos.side == "long")):
+                # 以当前价格平仓
+                if pos.side == "long":
+                    realized = (last_price - pos.entry_price) * pos.qty
+                else:
+                    realized = (pos.entry_price - last_price) * pos.qty
+
+                pos.realized_pnl += realized
+                TOTAL_REALIZED_PNL += realized
+                symbol_line.append(
+                    f"平仓: {pos.side.upper()} @ {last_price:.4f}, "
+                    f"本次盈亏: {realized:.2f} USDT, 累计: {pos.realized_pnl:.2f} USDT"
+                )
+                # 清掉持仓
+                POSITIONS[symbol] = None
+
+                pos = None
+                unreal_pnl = 0.0
+
+            # 3) 开仓条件：当前无仓 && 信号 != 0
+            if pos is None and signal != 0:
+                side = "long" if signal == 1 else "short"
+                notional = PER_TRADE_NOTIONAL
+                qty = notional / last_price
+
+                pos = Position(
+                    symbol=symbol,
+                    side=side,
+                    entry_price=last_price,
+                    qty=qty,
+                    notional=notional,
+                )
+                POSITIONS[symbol] = pos
+
+                symbol_line.append(
+                    f"开仓: {side.upper()} @ {last_price:.4f}, "
+                    f"名义资金: {notional:.2f} USDT, 数量: {qty:.6f}"
+                )
+
+            # 4) 如果现在有仓位，报告当前浮盈/浮亏
+            pos = POSITIONS.get(symbol)
+            if pos is not None:
+                if pos.side == "long":
+                    unreal_pnl = (last_price - pos.entry_price) * pos.qty
+                else:
+                    unreal_pnl = (pos.entry_price - last_price) * pos.qty
+
+                symbol_line.append(
+                    f"持仓: {pos.side.upper()} @ {pos.entry_price:.4f}, "
+                    f"浮动盈亏: {unreal_pnl:.2f} USDT, 累计已实现: {pos.realized_pnl:.2f} USDT"
+                )
+            else:
+                symbol_line.append("当前无持仓")
+
+            lines.append("\n".join(symbol_line))
+            lines.append("")  # 空行分隔
+        except Exception as e:
+            logger.exception("运行策略失败: %s", symbol)
+            lines.append(f"{symbol}: 运行策略失败：{e}")
+
+    lines.append(f"\n组合累计已实现盈亏: {TOTAL_REALIZED_PNL:.2f} USDT")
+    return "\n".join(lines)
 
 # ========= 行情相关函数（你以后可以单独拆到 market_service.py） =========
 
@@ -180,18 +339,23 @@ async def job_push_price(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def job_push_strategy(context: ContextTypes.DEFAULT_TYPE):
-    """定时给订阅用户推送策略筛选信号"""
+    """每小时推送一次：策略信号 + 仓位盈亏"""
+    try:
+        text = run_strategy_and_update_positions()
+    except Exception:
+        logger.exception("策略任务失败")
+        text = "策略任务运行失败，请查看日志。"
+
+    # 给所有订阅了策略的用户推送（用你之前的 STRATEGY_SUBSCRIBERS）
     if not STRATEGY_SUBSCRIBERS:
         return
 
-    try:
-        signals = get_demo_strategy_signals()
-        text = format_signals_text(signals)
-
-        for chat_id in list(STRATEGY_SUBSCRIBERS):
+    for chat_id in list(STRATEGY_SUBSCRIBERS):
+        try:
             await context.application.bot.send_message(chat_id=chat_id, text=text)
-    except Exception:
-        logger.exception("定时策略推送失败")
+        except Exception:
+            logger.exception("发送策略推送失败 chat_id=%s", chat_id)
+
 
 
 # ========= 程序入口 =========
@@ -219,22 +383,21 @@ def main():
     if jq is None:
         logger.warning(
             "JobQueue 未启用，定时推送功能不可用。"
-            "如果想开启，请确认 requirements.txt 中安装的是 "
-            'python-telegram-bot[job-queue]>=20.0'
+            "请确认 requirements.txt 中安装的是 python-telegram-bot[job-queue]>=20.0"
         )
     else:
-        # 每 10 分钟推一次行情
+        # 行情推送（你之前的）
         jq.run_repeating(
             job_push_price,
             interval=10 * 60,
             first=30,
             name="price_push",
         )
-        # 每 15 分钟推一次策略信号
+        # 策略推送：每小时一次，首次延迟 120 秒
         jq.run_repeating(
             job_push_strategy,
-            interval=15 * 60,
-            first=60,
+            interval=60 * 60,
+            first=120,
             name="strategy_push",
         )
 
