@@ -1,10 +1,16 @@
 import os
 import logging
 import requests
-from telegram import Update
-from telegram.ext import Application, CommandHandler
+from typing import List, Dict
 
-# 从环境变量里读取 Telegram Bot 的 Token（稍后在 Railway 里配置）
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+)
+
+# 从环境变量里读取 Telegram Bot 的 Token（在 Railway 里配置）
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 logging.basicConfig(
@@ -13,51 +19,81 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ========= 全局订阅表（简单版：内存里存一份） =========
+PRICE_SUBSCRIBERS: set[int] = set()
+STRATEGY_SUBSCRIBERS: set[int] = set()
 
-def get_btc_price():
-    """从 Binance 公共 API 获取 BTCUSDT 现价"""
-    url = "https://api.binance.com/api/v3/ticker/price"
-    params = {"symbol": "BTCUSDT"}
-    resp = requests.get(url, params=params, timeout=5)
+
+# ========= 行情相关函数（你以后可以单独拆到 market_service.py） =========
+
+BINANCE_URL = "https://api.binance.com/api/v3/ticker/price"
+
+
+def get_price(symbol: str) -> float:
+    """获取任意交易对现价，例如 BTCUSDT / ETHUSDT"""
+    resp = requests.get(
+        BINANCE_URL,
+        params={"symbol": symbol.upper()},
+        timeout=5,
+    )
     resp.raise_for_status()
     data = resp.json()
     return float(data["price"])
 
 
-async def start(update: Update, context):
-    user = update.effective_user
-    text = (
-        f"你好，{user.first_name or '朋友'}！\n"
-        "我是你的 Crypto Assistant 机器人。\n\n"
-        "目前支持的命令：\n"
-        "/price - 查看 BTC 当前价格\n"
-    )
-    await update.message.reply_text(text)
+def get_market_snapshot(symbols: List[str]) -> Dict[str, float]:
+    """一次性获取多币种价格"""
+    return {sym: get_price(sym) for sym in symbols}
 
 
-async def price(update: Update, context):
-    try:
-        p = get_btc_price()
-        await update.message.reply_text(f"当前 BTC/USDT 价格约为：{p:.2f} USDT")
-    except Exception as e:
-        logger.exception("获取价格失败")
-        await update.message.reply_text("获取价格失败，请稍后再试。")
+# ========= 策略信号相关函数（以后你可换成自己策略引擎） =========
+
+def get_demo_strategy_signals() -> List[Dict]:
+    """
+    这里先写一个“演示版策略信号”：
+    实际使用时你可以改成：
+      - 调你自己的 HTTP 接口
+      - 读数据库 / 文件
+      - 直接在这里写筛选逻辑
+    """
+    # 没有信号时可以返回空列表 []
+    return [
+        {
+            "symbol": "BTCUSDT",
+            "direction": "多头",
+            "entry": 68000,
+            "stop": 66000,
+            "target": 72000,
+            "reason": "演示信号：突破 20 日高点，量能放大",
+        },
+        {
+            "symbol": "ETHUSDT",
+            "direction": "空头",
+            "entry": 3800,
+            "stop": 3950,
+            "target": 3500,
+            "reason": "演示信号：跌破趋势线，MACD 死叉",
+        },
+    ]
 
 
-def main():
-    if not TOKEN:
-        raise RuntimeError("环境变量 TELEGRAM_BOT_TOKEN 没有设置！")
+def format_signals_text(signals: List[Dict]) -> str:
+    if not signals:
+        return "当前没有新的策略信号。"
 
-    # 使用新的 Application 类
-    application = Application.builder().token(TOKEN).build()
+    lines = ["[策略筛选信号]"]
+    for s in signals:
+        line = (
+            f"{s['symbol']} | {s['direction']}\n"
+            f"  入场: {s['entry']}\n"
+            f"  止损: {s['stop']}  止盈: {s['target']}\n"
+            f"  原因: {s['reason']}\n"
+        )
+        lines.append(line)
+    return "\n".join(lines)
 
-    # 添加命令处理
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("price", price))
 
-    logger.info("🤖 Bot 已启动，开始轮询 Telegram 消息...")
-    application.run_polling()
+# ========= 命令处理函数（handlers） =========
 
-
-if __name__ == "__main__":
-    main()
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.eff
