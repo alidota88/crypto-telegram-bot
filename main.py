@@ -215,10 +215,29 @@ def main():
 
     # 定时任务（JobQueue）
     jq = application.job_queue
-    # 每 10 分钟推一次行情（你可以改成 60 * 60 = 1 小时等）
-    jq.run_repeating(job_push_price, interval=10 * 60, first=30, name="price_push")
-    # 每 15 分钟推一次策略信号（演示）
-    jq.run_repeating(job_push_strategy, interval=15 * 60, first=60, name="strategy_push")
+
+    if jq is None:
+        logger.warning(
+            "JobQueue 未启用，定时推送功能不可用。"
+            "如果想开启，请确认 requirements.txt 中安装的是 "
+            'python-telegram-bot[job-queue]>=20.0'
+        )
+    else:
+        # 每 10 分钟推一次行情
+        jq.run_repeating(
+            job_push_price,
+            interval=10 * 60,
+            first=30,
+            name="price_push",
+        )
+        # 每 15 分钟推一次策略信号
+        jq.run_repeating(
+            job_push_strategy,
+            interval=15 * 60,
+            first=60,
+            name="strategy_push",
+        )
+
 
     logger.info("🤖 Bot 已启动，开始轮询 Telegram 消息...")
     application.run_polling()
