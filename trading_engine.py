@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import Dict, List
 
 from macd_rsi_strategy import MACDRSIStrategy
+from simple_strategy import SimpleMACDStrategy
 from market_service import fetch_15m_klines
 
 TOTAL_CAPITAL = 10_000.0          # 总资金（展示用）
@@ -18,6 +19,13 @@ class Position:
     notional: float
     realized_pnl: float = 0.0
 
+# 使用简单策略做模拟交易的持仓
+POSITIONS: Dict[str, Position | None] = {}
+TOTAL_REALIZED_PNL: float = 0.0
+
+# 策略实例：保留你原来的 + 新增一个简单策略
+main_strategy = MACDRSIStrategy()       # 原 MACD+RSI 多周期策略
+simple_strategy = SimpleMACDStrategy()  # 新简单 MACD 策略
 
 # 当前持仓 & 累计盈亏（简单内存版）
 POSITIONS: Dict[str, Position | None] = {}
@@ -28,27 +36,50 @@ strategy = MACDRSIStrategy()
 
 def run_strategy_and_update_positions() -> str:
     """
-    对 TRADE_SYMBOLS 跑一轮策略，更新模拟持仓 & 计算盈亏，
+    对 TRADE_SYMBOLS 跑一轮：
+      - 用 MACDRSIStrategy 计算主策略信号（只展示，不开仓）
+      - 用 SimpleMACDStrategy 计算简单策略信号（用来模拟开平仓）
     返回一段适合发到 Telegram 的文本。
     """
     global TOTAL_REALIZED_PNL
 
     lines: List[str] = []
-    lines.append("[策略信号 + 仓位模拟（每小时）]")
+    lines.append("[多策略信号 + 仓位模拟（每小时）]")
     lines.append(f"总资金假设: {TOTAL_CAPITAL:.2f} USDT, 每个品种开仓: {PER_TRADE_NOTIONAL:.2f} USDT\n")
 
     for symbol in TRADE_SYMBOLS:
         try:
             df_15m = fetch_15m_klines(symbol, limit=300)
-            df_sig = strategy.generate_signals(df_15m)
-            last = df_sig.iloc[-1]
-            last_price = float(last["close"])
-            signal = int(last["signal"])  # 1=多, -1=空, 0=无操作
+
+            # 1️⃣ 主策略（你的 MACD+RSI 多周期策略）——只用来观察信号情况
+            df_main = main_strategy.generate_signals(df_15m)
+            main_last_signal = int(df_main["signal"].iloc[-1])
+            main_total_signals = int((df_main["signal"] != 0).sum())
+
+            # 2️⃣ 简单策略（15m MACD 金叉/死叉）——用来开仓/平仓
+            df_simple = simple_strategy.generate_signals(df_15m)
+            simple_last_signal = int(df_simple["simple_signal"].iloc[-1])
+            simple_total_signals = int((df_simple["simple_signal"] != 0).sum())
+
+            last_price = float(df_simple["close"].iloc[-1])
+
+            symbol_lines: List[str] = []
+            symbol_lines.append(f"{symbol} 当前价: {last_price:.4f}")
+
+            # 展示两套策略的信号情况（方便你判断是不是策略太严）
+            symbol_lines.append(
+                f"主策略: 当前 signal={main_last_signal}, 历史触发次数={main_total_signals}"
+            )
+            symbol_lines.append(
+                f"简单策略: 当前 signal={simple_last_signal}, 历史触发次数={simple_total_signals}"
+            )
+
+            # 3️⃣ 用简单策略的信号 simple_last_signal 来驱动模拟交易
+            trade_signal = simple_last_signal  # 1=多, -1=空, 0=不动
 
             pos = POSITIONS.get(symbol)
-            symbol_lines: List[str] = [f"{symbol} 当前价: {last_price:.4f}"]
 
-            # 1) 已有持仓，先算浮盈亏
+            # 先算已有持仓的浮盈亏
             unreal_pnl = 0.0
             if pos is not None:
                 if pos.side == "long":
@@ -56,8 +87,8 @@ def run_strategy_and_update_positions() -> str:
                 else:
                     unreal_pnl = (pos.entry_price - last_price) * pos.qty
 
-            # 2) 平仓逻辑：已有仓位 & 信号反向 或 signal == 0
-            if pos is not None and (signal == 0 or (signal == 1 and pos.side == "short") or (signal == -1 and pos.side == "long")):
+            # 3.1 平仓逻辑：已有仓位 & 简单策略给出反向信号 或 0
+            if pos is not None and (trade_signal == 0 or (trade_signal == 1 and pos.side == "short") or (trade_signal == -1 and pos.side == "long")):
                 if pos.side == "long":
                     realized = (last_price - pos.entry_price) * pos.qty
                 else:
@@ -75,9 +106,9 @@ def run_strategy_and_update_positions() -> str:
                 pos = None
                 unreal_pnl = 0.0
 
-            # 3) 开仓逻辑：当前无仓 & 有新信号
-            if pos is None and signal != 0:
-                side = "long" if signal == 1 else "short"
+            # 3.2 开仓逻辑：当前无仓 & 简单策略有新信号
+            if pos is None and trade_signal != 0:
+                side = "long" if trade_signal == 1 else "short"
                 notional = PER_TRADE_NOTIONAL
                 qty = notional / last_price
 
@@ -95,7 +126,7 @@ def run_strategy_and_update_positions() -> str:
                     f"名义资金: {notional:.2f} USDT, 数量: {qty:.6f}"
                 )
 
-            # 4) 持仓状态展示
+            # 3.3 展示当前持仓状态
             pos = POSITIONS.get(symbol)
             if pos is not None:
                 if pos.side == "long":
@@ -113,7 +144,8 @@ def run_strategy_and_update_positions() -> str:
             lines.append("\n".join(symbol_lines))
             lines.append("")  # 空行分隔
         except Exception as e:
-            lines.append(f"{symbol}: 运行策略失败：{e}")
+            lines.append(f"{symbol}: 运行多策略失败：{e}")
 
-    lines.append(f"\n组合累计已实现盈亏: {TOTAL_REALIZED_PNL:.2f} USDT")
+    lines.append(f"\n简单策略组合累计已实现盈亏: {TOTAL_REALIZED_PNL:.2f} USDT")
     return "\n".join(lines)
+
