@@ -88,21 +88,33 @@ async def unsub_strategy(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ========= 定时任务 =========
 
-async def job_push_price(context: ContextTypes.DEFAULT_TYPE):
-    """定时给订阅用户推行情（BTC & ETH）"""
-    if not PRICE_SUBSCRIBERS:
+async def job_push_strategy(context: ContextTypes.DEFAULT_TYPE):
+    """定时跑一轮策略，有开仓/平仓事件就立刻推送"""
+    if not STRATEGY_SUBSCRIBERS:
         return
-    try:
-        snapshot = get_market_snapshot(["BTCUSDT", "ETHUSDT"])
-        lines = ["[定时行情推送]"]
-        for sym, price_ in snapshot.items():
-            lines.append(f"{sym}: {price_:.2f} USDT")
-        text = "\n".join(lines)
 
-        for chat_id in list(PRICE_SUBSCRIBERS):
-            await context.application.bot.send_message(chat_id=chat_id, text=text)
+    try:
+        summary_text, trade_events = run_strategy_and_update_positions()
     except Exception:
-        logger.exception("定时行情推送失败")
+        logger.exception("策略任务失败")
+        return
+
+    # 没有新开仓/平仓，就不推送，避免打扰
+    if not trade_events:
+        return
+
+    # 有订阅的人，每人推送本次所有新事件
+    for chat_id in list(STRATEGY_SUBSCRIBERS):
+        for msg in trade_events:
+            try:
+                await context.application.bot.send_message(chat_id=chat_id, text=msg)
+            except Exception:
+                logger.exception("发送策略推送失败 chat_id=%s", chat_id)
+
+    # 如果你以后想顺带推送 summary，可以在这里追加一条：
+    # for chat_id in list(STRATEGY_SUBSCRIBERS):
+    #     await context.application.bot.send_message(chat_id=chat_id, text=summary_text)
+
 
 
 async def job_push_strategy(context: ContextTypes.DEFAULT_TYPE):
