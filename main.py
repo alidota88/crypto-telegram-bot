@@ -170,10 +170,11 @@ def main():
         # 策略：每小时推一次（调试时可以改小）
         jq.run_repeating(
             job_push_strategy,
-            interval=60 * 60,
-            first=120,
+            interval=60,      # 每 60 秒跑一轮策略
+            first=30,         # 启动后 30 秒跑第一轮
             name="strategy_push",
         )
+
 
     logger.info("🤖 Bot 已启动，开始轮询 Telegram 消息...")
     application.run_polling()
