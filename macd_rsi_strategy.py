@@ -81,7 +81,7 @@ class MACDRSIStrategy:
         cfg = self.cfg
 
         # 用 15m resample 成 4h
-        ohlc_4h = df_15m[["open", "high", "low", "close"]].resample("4H").agg(
+        ohlc_4h = df_15m[["open", "high", "low", "close"]].resample("4h").agg(
             {
                 "open": "first",
                 "high": "max",
