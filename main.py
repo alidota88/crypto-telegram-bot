@@ -35,7 +35,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "订阅相关：\n"
         "/sub_price      - 订阅定时行情推送\n"
         "/unsub_price    - 取消定时行情推送\n"
-        "/sub_strategy   - 订阅策略筛选信号推送\n"
+        "/sub_strategy   - 订阅策略筛选信号推送（实时开/平仓通知）\n"
         "/unsub_strategy - 取消策略信号推送\n"
     )
     await update.message.reply_text(text)
@@ -65,31 +65,52 @@ async def market(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def sub_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     PRICE_SUBSCRIBERS.add(chat_id)
-    await update.message.reply_text("已订阅：定时行情推送。")
+    await update.message.reply_text("✅ 已订阅：定时行情推送（每 10 分钟一次）。")
 
 
 async def unsub_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     PRICE_SUBSCRIBERS.discard(chat_id)
-    await update.message.reply_text("已取消：定时行情推送。")
+    await update.message.reply_text("✅ 已取消：定时行情推送。")
 
 
 async def sub_strategy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     STRATEGY_SUBSCRIBERS.add(chat_id)
-    await update.message.reply_text("已订阅：策略筛选信号推送。")
+    await update.message.reply_text("✅ 已订阅：策略筛选信号推送（有开仓/平仓就立刻提醒）。")
 
 
 async def unsub_strategy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     STRATEGY_SUBSCRIBERS.discard(chat_id)
-    await update.message.reply_text("已取消：策略筛选信号推送。")
+    await update.message.reply_text("✅ 已取消：策略信号推送。")
 
 
 # ========= 定时任务 =========
 
+async def job_push_price(context: ContextTypes.DEFAULT_TYPE):
+    """定时给订阅用户推行情（BTC & ETH）"""
+    if not PRICE_SUBSCRIBERS:
+        return
+    try:
+        snapshot = get_market_snapshot(["BTCUSDT", "ETHUSDT"])
+        lines = ["[定时行情推送]"]
+        for sym, price_ in snapshot.items():
+            lines.append(f"{sym}: {price_:.2f} USDT")
+        text = "\n".join(lines)
+
+        for chat_id in list(PRICE_SUBSCRIBERS):
+            await context.application.bot.send_message(chat_id=chat_id, text=text)
+    except Exception:
+        logger.exception("定时行情推送失败")
+
+
 async def job_push_strategy(context: ContextTypes.DEFAULT_TYPE):
-    """定时跑一轮策略，有开仓/平仓事件就立刻推送"""
+    """
+    定时跑一轮多策略：
+    - 用简单策略控制开/平仓
+    - 有新开仓/平仓事件就立刻推送
+    """
     if not STRATEGY_SUBSCRIBERS:
         return
 
@@ -111,28 +132,9 @@ async def job_push_strategy(context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 logger.exception("发送策略推送失败 chat_id=%s", chat_id)
 
-    # 如果你以后想顺带推送 summary，可以在这里追加一条：
+    # 如果你以后想顺带推送完整 summary，可以解除下面注释：
     # for chat_id in list(STRATEGY_SUBSCRIBERS):
     #     await context.application.bot.send_message(chat_id=chat_id, text=summary_text)
-
-
-
-async def job_push_strategy(context: ContextTypes.DEFAULT_TYPE):
-    """定时给订阅用户推策略信号 + 模拟盈亏"""
-    if not STRATEGY_SUBSCRIBERS:
-        return
-
-    try:
-        text = run_strategy_and_update_positions()
-    except Exception:
-        logger.exception("策略任务失败")
-        text = "策略任务运行失败，请查看日志。"
-
-    for chat_id in list(STRATEGY_SUBSCRIBERS):
-        try:
-            await context.application.bot.send_message(chat_id=chat_id, text=text)
-        except Exception:
-            logger.exception("发送策略推送失败 chat_id=%s", chat_id)
 
 
 # ========= 入口 =========
@@ -152,7 +154,7 @@ def main():
     application.add_handler(CommandHandler("sub_strategy", sub_strategy))
     application.add_handler(CommandHandler("unsub_strategy", unsub_strategy))
 
-    # 注册 JobQueue
+    # 注册 JobQueue（定时任务）
     jq = application.job_queue
     if jq is None:
         logger.warning(
@@ -167,14 +169,13 @@ def main():
             first=30,
             name="price_push",
         )
-        # 策略：每小时推一次（调试时可以改小）
+        # 策略：每 60 秒跑一轮，有开/平仓就立刻推送
         jq.run_repeating(
             job_push_strategy,
-            interval=60,      # 每 60 秒跑一轮策略
-            first=30,         # 启动后 30 秒跑第一轮
+            interval=60,
+            first=30,
             name="strategy_push",
         )
-
 
     logger.info("🤖 Bot 已启动，开始轮询 Telegram 消息...")
     application.run_polling()
