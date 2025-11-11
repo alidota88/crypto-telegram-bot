@@ -1,4 +1,4 @@
-from typing import List, Dict
+from typing import Dict, List
 import requests
 import pandas as pd
 
@@ -19,16 +19,12 @@ def get_market_snapshot(symbols: List[str]) -> Dict[str, float]:
     return {sym: get_price(sym) for sym in symbols}
 
 
-def fetch_15m_klines(symbol: str, limit: int = 300) -> pd.DataFrame:
-    """
-    从 Binance 获取 15m K 线，并转成 DataFrame:
-    index = 时间（DatetimeIndex）
-    columns = open, high, low, close, volume
-    """
+def fetch_klines(symbol: str, interval: str, limit: int = 300) -> pd.DataFrame:
+    """从 Binance 获取指定周期的 K 线。"""
     url = f"{BINANCE_BASE}/api/v3/klines"
     params = {
         "symbol": symbol.upper(),
-        "interval": "15m",
+        "interval": interval,
         "limit": limit,
     }
     resp = requests.get(url, params=params, timeout=10)
@@ -48,3 +44,10 @@ def fetch_15m_klines(symbol: str, limit: int = 300) -> pd.DataFrame:
     df = df[["open", "high", "low", "close", "volume"]].astype(float)
     df.index = df.index.sort_values()
     return df
+
+
+def fetch_15m_klines(symbol: str, limit: int = 300) -> pd.DataFrame:
+    """
+    向后兼容的 15m K 线抓取函数。
+    """
+    return fetch_klines(symbol, interval="15m", limit=limit)
