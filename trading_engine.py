@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from typing import Dict, List
 
-from macd_rsi_strategy import MACDRSIStrategy
+from multi_tf_midterm_strategy import MultiTFMidtermStrategy
 from simple_strategy import SimpleMACDStrategy
 from market_service import fetch_15m_klines
 
@@ -24,7 +24,7 @@ POSITIONS: Dict[str, Position | None] = {}
 TOTAL_REALIZED_PNL: float = 0.0
 
 # 策略实例：保留你原来的 + 新增一个简单策略
-main_strategy = MACDRSIStrategy()       # 原 MACD+RSI 多周期策略
+main_strategy = MultiTFMidtermStrategy()  # 新四周期中线策略
 simple_strategy = SimpleMACDStrategy()  # 新简单 MACD 策略
 
 # 当前持仓 & 累计盈亏（简单内存版）
@@ -77,7 +77,11 @@ def run_strategy_and_update_positions() -> tuple[str, List[str]]:
             )
 
             # 3) 用简单策略信号做交易
-            trade_signal = simple_last_signal  # 1=多, -1=空, 0=不动
+            trade_signal = (
+                simple_last_signal 
+                if (simple_last_signal != 0 and simple_last_signal == main_last_signal) 
+                else 0
+            )
 
             pos = POSITIONS.get(symbol)
 
