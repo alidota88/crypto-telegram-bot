@@ -1,7 +1,17 @@
+# === imports (放在文件最开头) ===
+import os, sys
 from dataclasses import dataclass
 from typing import Dict, List
 
-from multi_tf_midterm_strategy import MultiTFMidtermStrategy
+# 允许同目录模块被 import（容器/某些运行环境下很有用）
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+# 主策略优先使用新的四周期中线策略；若文件未就位，则回退到旧策略以不中断运行
+try:
+    from multi_tf_midterm_strategy import MultiTFMidtermStrategy
+except ModuleNotFoundError:
+    from macd_rsi_strategy import MACDRSIStrategy as MultiTFMidtermStrategy
+
 from simple_strategy import SimpleMACDStrategy
 from market_service import fetch_15m_klines
 
@@ -31,7 +41,9 @@ simple_strategy = SimpleMACDStrategy()  # 新简单 MACD 策略
 POSITIONS: Dict[str, Position | None] = {}
 TOTAL_REALIZED_PNL: float = 0.0
 
-strategy = MACDRSIStrategy()
+# 策略实例：主策略(四周期中线) + 简单策略(执行层)
+main_strategy = MultiTFMidtermStrategy()
+simple_strategy = SimpleMACDStrategy()
 
 
 def run_strategy_and_update_positions() -> tuple[str, List[str]]:
@@ -77,8 +89,13 @@ def run_strategy_and_update_positions() -> tuple[str, List[str]]:
             )
 
             # 3) 用简单策略信号做交易
+            # 与主趋势同向才交易：若 simple 与 main 不一致，或 simple 为 0，则不开仓
             trade_signal = (
-                simple_last_signal 
+                simple_last_signal
+                if (simple_last_signal != 0 and simple_last_signal == main_last_signal)
+                else 0
+            )
+
                 if (simple_last_signal != 0 and simple_last_signal == main_last_signal) 
                 else 0
             )
